@@ -9,6 +9,7 @@ from artcommonlib.assembly import (
     assembly_excluded_components,
     assembly_group_config,
     assembly_metadata_config,
+    assembly_own_issues_config,
     assembly_resolved,
     assembly_rhcos_config,
 )
@@ -757,3 +758,57 @@ releases:
             _merger({'r-': [1, 2]}, {'r': [3, 4]}),
             {},
         )
+
+
+class TestAssemblyOwnIssuesConfig(TestCase):
+    def setUp(self):
+        releases_yml = """
+releases:
+  parent_assembly:
+    assembly:
+      basis:
+        time: "2026-01-01T00:00:00+00:00"
+      issues:
+        include:
+          - id: OCPBUGS-100
+        exclude:
+          - id: OCPBUGS-200
+  child_assembly:
+    assembly:
+      basis:
+        assembly: parent_assembly
+      issues:
+        include:
+          - id: OCPBUGS-300
+        exclude:
+          - id: OCPBUGS-400
+  no_issues_assembly:
+    assembly:
+      basis:
+        time: "2026-01-01T00:00:00+00:00"
+"""
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+
+    def test_own_issues_not_inherited(self):
+        """Child assembly must NOT inherit parent's issues.include or issues.exclude."""
+        config = assembly_own_issues_config(self.releases_config, "child_assembly")
+        include_ids = [i["id"] for i in config.include]
+        exclude_ids = [i["id"] for i in config.exclude]
+        self.assertIn("OCPBUGS-300", include_ids)
+        self.assertNotIn("OCPBUGS-100", include_ids)
+        self.assertIn("OCPBUGS-400", exclude_ids)
+        self.assertNotIn("OCPBUGS-200", exclude_ids)
+
+    def test_no_issues_key_returns_empty(self):
+        """Assembly with no issues key returns a Model with empty include/exclude."""
+        config = assembly_own_issues_config(self.releases_config, "no_issues_assembly")
+        self.assertEqual(list(config.include), [])
+        self.assertEqual(list(config.exclude), [])
+
+    def test_none_assembly_returns_empty(self):
+        config = assembly_own_issues_config(self.releases_config, None)
+        self.assertEqual(config.primitive(), {})
+
+    def test_none_releases_config_returns_empty(self):
+        config = assembly_own_issues_config(None, "child_assembly")
+        self.assertEqual(config.primitive(), {})

@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Set
 
 import click
 from artcommonlib import arch_util, logutil
-from artcommonlib.assembly import assembly_config_struct, assembly_issues_config
+from artcommonlib.assembly import assembly_config_struct, assembly_own_issues_config
 from artcommonlib.format_util import green_print
 from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.util import is_ocp_delivery_repo, new_roundtrip_yaml_handler
@@ -415,7 +415,7 @@ def get_builds_by_advisory_kind(runtime: Runtime) -> Dict[str, List[str]]:
 
 def get_assembly_bug_ids(runtime, bug_tracker_type) -> tuple[Set[str], Set[str]]:
     # Loads included/excluded bugs from assembly config
-    issues_config = assembly_issues_config(runtime.get_releases_config(), runtime.assembly)
+    issues_config = assembly_own_issues_config(runtime.get_releases_config(), runtime.assembly)
     included_bug_ids = {i["id"] for i in issues_config.include}
     excluded_bug_ids = {i["id"] for i in issues_config.exclude}
 

@@ -660,25 +660,39 @@ class TestCategorizeBugsByType(unittest.TestCase):
 
 
 class TestGenAssemblyBugIDs(unittest.TestCase):
-    @patch("elliottlib.cli.find_bugs_sweep_cli.assembly_issues_config")
-    def test_gen_assembly_bug_ids_jira(self, assembly_issues_config: Mock):
-        assembly_issues_config.return_value = flexmock(
-            include=[{"id": 1}, {"id": 'OCPBUGS-2'}], exclude=[{"id": "2"}, {"id": 'OCPBUGS-3'}]
+    @patch("elliottlib.cli.find_bugs_sweep_cli.assembly_own_issues_config")
+    def test_gen_assembly_bug_ids_jira(self, assembly_own_issues_config: Mock):
+        assembly_own_issues_config.return_value = flexmock(
+            include=[{"id": 1}, {"id": "OCPBUGS-2"}], exclude=[{"id": "2"}, {"id": "OCPBUGS-3"}]
         )
-        runtime = flexmock(get_releases_config=lambda: None, assembly='foo')
+        runtime = flexmock(get_releases_config=lambda: None, assembly="foo")
         expected = ({"OCPBUGS-2"}, {"OCPBUGS-3"})
-        actual = get_assembly_bug_ids(runtime, 'jira')
+        actual = get_assembly_bug_ids(runtime, "jira")
         self.assertEqual(actual, expected)
 
-    @patch("elliottlib.cli.find_bugs_sweep_cli.assembly_issues_config")
-    def test_gen_assembly_bug_ids_bz(self, assembly_issues_config: Mock):
-        assembly_issues_config.return_value = flexmock(
-            include=[{"id": 1}, {"id": 'OCPBUGS-2'}], exclude=[{"id": "2"}, {"id": 'OCPBUGS-3'}]
+    @patch("elliottlib.cli.find_bugs_sweep_cli.assembly_own_issues_config")
+    def test_gen_assembly_bug_ids_bz(self, assembly_own_issues_config: Mock):
+        assembly_own_issues_config.return_value = flexmock(
+            include=[{"id": 1}, {"id": "OCPBUGS-2"}], exclude=[{"id": "2"}, {"id": "OCPBUGS-3"}]
         )
-        runtime = flexmock(get_releases_config=lambda: None, assembly='foo')
+        runtime = flexmock(get_releases_config=lambda: None, assembly="foo")
         expected = ({1}, {"2"})
-        actual = get_assembly_bug_ids(runtime, 'bugzilla')
+        actual = get_assembly_bug_ids(runtime, "bugzilla")
         self.assertEqual(actual, expected)
+
+    @patch("elliottlib.cli.find_bugs_sweep_cli.assembly_own_issues_config")
+    def test_gen_assembly_bug_ids_does_not_use_inherited_bugs(self, assembly_own_issues_config: Mock):
+        """Verify get_assembly_bug_ids calls assembly_own_issues_config, not assembly_issues_config.
+
+        If it called assembly_issues_config, inherited bugs from parent assemblies would bleed in.
+        This test asserts the function uses only the own-issues variant.
+        """
+        assembly_own_issues_config.return_value = flexmock(include=[{"id": "OCPBUGS-999"}], exclude=[])
+        runtime = flexmock(get_releases_config=lambda: None, assembly="child_assembly")
+        included, excluded = get_assembly_bug_ids(runtime, "jira")
+        self.assertEqual(included, {"OCPBUGS-999"})
+        self.assertEqual(excluded, set())
+        assembly_own_issues_config.assert_called_once()
 
 
 class TestExtrasBugs(unittest.TestCase):
