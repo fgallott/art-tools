@@ -981,3 +981,90 @@ class TestPrepareReleaseKonfluxPipeline(unittest.IsolatedAsyncioTestCase):
         mock_set_shipment_mr_ready.assert_awaited_once()
         mock_verify_payload.assert_awaited_once()
         mock_report_deferred_build_failures.assert_awaited_once_with(pipeline.bundle_build_errors)
+
+    async def test_check_blockers_skips_when_basis_assembly_has_included_bugs(self):
+        """Blocker check skipped when assembly has basis.assembly AND issues.include (targeted fix)."""
+        pipeline = PrepareReleaseKonfluxPipeline(
+            slack_client=self.mock_slack_client,
+            runtime=self.runtime,
+            group=self.group,
+            assembly=self.assembly,
+        )
+        pipeline.gitlab_token = self.gitlab_token
+        pipeline.assembly_type = AssemblyTypes.STANDARD
+        pipeline.releases_config = Model(
+            {
+                "releases": {
+                    "test-assembly": {
+                        "assembly": {
+                            "type": AssemblyTypes.STANDARD.value,
+                            "basis": {"assembly": "test-assembly-parent"},
+                            "issues": {
+                                "include": [
+                                    {"id": "OCPBUGS-85292"},
+                                    {"id": "OCPBUGS-99999"},
+                                ],
+                                "exclude": [],
+                            },
+                            "group": {"product": "ocp", "release_date": "2025-Oct-22"},
+                        }
+                    }
+                }
+            }
+        )
+        pipeline.logger = Mock()
+        pipeline.execute_command_with_logging = AsyncMock()
+
+        await pipeline.check_blockers()
+
+        # Blocker check skipped — basis assembly + included bugs = targeted fix
+        pipeline.execute_command_with_logging.assert_not_called()
+
+    async def test_check_blockers_runs_when_no_basis_assembly(self):
+        """Blocker check still runs when assembly has issues.include but no basis.assembly."""
+        pipeline = PrepareReleaseKonfluxPipeline(
+            slack_client=self.mock_slack_client,
+            runtime=self.runtime,
+            group=self.group,
+            assembly=self.assembly,
+        )
+        pipeline.gitlab_token = self.gitlab_token
+        pipeline.assembly_type = AssemblyTypes.STANDARD
+        pipeline.releases_config = Model(
+            {
+                "releases": {
+                    "test-assembly": {
+                        "assembly": {
+                            "type": AssemblyTypes.STANDARD.value,
+                            "issues": {
+                                "include": [{"id": "OCPBUGS-85292"}],
+                            },
+                        }
+                    }
+                }
+            }
+        )
+        pipeline.logger = Mock()
+        pipeline.execute_command_with_logging = AsyncMock(return_value="Found 0 bugs: ")
+
+        await pipeline.check_blockers()
+
+        # Blocker check runs because no basis.assembly
+        pipeline.execute_command_with_logging.assert_called_once()
+
+    async def test_check_blockers_skips_non_standard_assembly(self):
+        """Test that check_blockers skips for non-standard assembly types."""
+        pipeline = PrepareReleaseKonfluxPipeline(
+            slack_client=self.mock_slack_client,
+            runtime=self.runtime,
+            group=self.group,
+            assembly=self.assembly,
+        )
+        pipeline.assembly_type = AssemblyTypes.STREAM
+        pipeline.logger = Mock()
+        pipeline.execute_command_with_logging = AsyncMock()
+
+        await pipeline.check_blockers()
+
+        # Verify that execute_command_with_logging was not called
+        pipeline.execute_command_with_logging.assert_not_called()
