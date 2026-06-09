@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, patch
 import yaml
 from doozerlib.lockfile_prototype.constants import (
     DEFAULT_RPM_LOCKFILE_NAME,
-    RPM_LOCKFILE_CONTAINERFILE,
     RPM_LOCKFILE_IMAGE,
 )
 from doozerlib.lockfile_prototype.models import (
@@ -22,11 +21,11 @@ from doozerlib.lockfile_prototype.models import (
 from doozerlib.lockfile_prototype.resolver import RpmResolver
 
 
-class TestEnsureImage(unittest.TestCase):
+class TestPullImage(unittest.TestCase):
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
-    def test_skips_build_when_image_exists(self, mock_gather):
+    def test_skips_pull_when_image_exists(self, mock_gather):
         """
-        When podman image exists returns 0, no build should happen.
+        When podman image exists returns 0, no pull should happen.
         """
         call_log = []
 
@@ -36,14 +35,14 @@ class TestEnsureImage(unittest.TestCase):
 
         mock_gather.side_effect = mock_cmd
         resolver = RpmResolver()
-        asyncio.run(resolver._ensure_image())
+        asyncio.run(resolver._pull_image())
         self.assertEqual(len(call_log), 1)
         self.assertEqual(call_log[0][:3], ["podman", "image", "exists"])
 
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
-    def test_builds_when_image_missing(self, mock_gather):
+    def test_pulls_when_image_missing(self, mock_gather):
         """
-        When podman image exists returns non-zero, should build.
+        When image missing, should pull without --creds if no token set.
         """
         call_log = []
 
@@ -55,28 +54,68 @@ class TestEnsureImage(unittest.TestCase):
 
         mock_gather.side_effect = mock_cmd
         resolver = RpmResolver()
-        asyncio.run(resolver._ensure_image())
+        asyncio.run(resolver._pull_image())
         self.assertEqual(len(call_log), 2)
-        self.assertEqual(call_log[1][:2], ["podman", "build"])
-        self.assertIn("-f", call_log[1])
-        self.assertIn(str(RPM_LOCKFILE_CONTAINERFILE), call_log[1])
+        self.assertEqual(call_log[1][:2], ["podman", "pull"])
+        self.assertNotIn("--creds", call_log[1])
+
+    @patch.dict(os.environ, {"RPM_LOCKFILE_IMAGE_PULLER_TOKEN": "test-token-123"})
+    @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
+    def test_pulls_with_creds_when_token_set(self, mock_gather):
+        """
+        When RPM_LOCKFILE_IMAGE_PULLER_TOKEN is set, should pass --creds.
+        """
+        call_log = []
+
+        async def mock_cmd(cmd, **kwargs):
+            call_log.append(cmd)
+            if cmd[1] == "image":
+                return (1, "", "")
+            return (0, "", "")
+
+        mock_gather.side_effect = mock_cmd
+        resolver = RpmResolver()
+        asyncio.run(resolver._pull_image())
+        self.assertEqual(len(call_log), 2)
+        self.assertIn("--creds", call_log[1])
+        creds_idx = call_log[1].index("--creds") + 1
+        self.assertEqual(call_log[1][creds_idx], "rpm-lockfile-image-puller:test-token-123")
 
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
-    def test_raises_on_build_failure(self, mock_gather):
+    def test_raises_on_pull_failure(self, mock_gather):
         """
-        Build failure should raise RuntimeError.
+        Pull failure should raise RuntimeError.
         """
 
         async def mock_cmd(cmd, **kwargs):
             if cmd[1] == "image":
                 return (1, "", "")
-            return (1, "", "STEP 2/7: RUN dnf install ... error")
+            return (1, "", "Error: error pulling image")
 
         mock_gather.side_effect = mock_cmd
         resolver = RpmResolver()
         with self.assertRaises(RuntimeError) as ctx:
-            asyncio.run(resolver._ensure_image())
-        self.assertIn("Failed to build", str(ctx.exception))
+            asyncio.run(resolver._pull_image())
+        self.assertIn("Failed to pull", str(ctx.exception))
+
+    @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
+    def test_skips_pull_after_first_success(self, mock_gather):
+        """
+        Once image is pulled, subsequent calls should be no-ops.
+        """
+        call_log = []
+
+        async def mock_cmd(cmd, **kwargs):
+            call_log.append(cmd)
+            if cmd[1] == "image":
+                return (1, "", "")
+            return (0, "", "")
+
+        mock_gather.side_effect = mock_cmd
+        resolver = RpmResolver()
+        asyncio.run(resolver._pull_image())
+        asyncio.run(resolver._pull_image())
+        self.assertEqual(len(call_log), 2)
 
 
 class TestRpmResolver(unittest.TestCase):
@@ -125,7 +164,7 @@ class TestRpmResolver(unittest.TestCase):
             yaml.safe_dump(self.FAKE_LOCKFILE_DATA, f)
         return (0, "", "")
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_resolve_bare_mode(self, mock_gather, mock_ensure):
         """
@@ -146,7 +185,7 @@ class TestRpmResolver(unittest.TestCase):
         self.assertIsInstance(result, LockfileData)
         self.assertEqual(result.lockfileVersion, 1)
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_resolve_with_image(self, mock_gather, mock_ensure):
         """
@@ -167,7 +206,7 @@ class TestRpmResolver(unittest.TestCase):
         self.assertIsInstance(result, LockfileData)
         self.assertEqual(result.lockfileVersion, 1)
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_resolve_failure(self, mock_gather, mock_ensure):
         """
@@ -188,7 +227,7 @@ class TestRpmResolver(unittest.TestCase):
             asyncio.run(resolver.resolve(config))
         self.assertIn("rpm-lockfile-prototype failed", str(ctx.exception))
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_resolve_uses_podman(self, mock_gather, mock_ensure):
         """
@@ -210,7 +249,7 @@ class TestRpmResolver(unittest.TestCase):
         asyncio.run(resolver.resolve(config))
         mock_gather.assert_called_once()
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_resolve_mounts_dnf_cache(self, mock_gather, mock_ensure):
         """
@@ -238,7 +277,7 @@ class TestRpmResolver(unittest.TestCase):
         self.assertTrue(dnf_cache_set)
 
     @patch.dict(os.environ, {"REGISTRY_AUTH_FILE": "/run/containers/auth.json"})
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_resolve_mounts_auth_file(self, mock_gather, mock_ensure):
         """
@@ -259,7 +298,7 @@ class TestRpmResolver(unittest.TestCase):
         )
         asyncio.run(resolver.resolve(config))
         cmd = captured_cmds[0]
-        auth_mount = "/run/containers/auth.json:/auth/auth.json:ro,Z"
+        auth_mount = "/run/containers/auth.json:/auth/auth.json:ro,z"
         self.assertTrue(
             any(arg == "-v" and cmd[i + 1] == auth_mount for i, arg in enumerate(cmd) if i + 1 < len(cmd)),
             f"Expected auth file mount {auth_mount} in command",
@@ -424,7 +463,7 @@ class TestResolveRpmdbCorruptionRetry(unittest.TestCase):
 
     CORRUPTION_STDERR = "error: sqlite failure: database disk image is malformed\nOSError: failed loading RPMDB\n"
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._clear_rpmdb_cache")
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_retries_on_rpmdb_corruption(self, mock_gather, mock_clear, mock_ensure):
@@ -461,7 +500,7 @@ class TestResolveRpmdbCorruptionRetry(unittest.TestCase):
         self.assertEqual(call_count, 2)
         mock_clear.assert_called_once()
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._clear_rpmdb_cache")
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_raises_after_retry_fails(self, mock_gather, mock_clear, mock_ensure):
@@ -485,7 +524,7 @@ class TestResolveRpmdbCorruptionRetry(unittest.TestCase):
             asyncio.run(resolver.resolve(config, image_pullspec="registry.example.com/repo@sha256:abc123"))
         self.assertIn("rpm-lockfile-prototype failed", str(ctx.exception))
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._clear_rpmdb_cache")
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_no_retry_without_image(self, mock_gather, mock_clear, mock_ensure):
@@ -508,7 +547,7 @@ class TestResolveRpmdbCorruptionRetry(unittest.TestCase):
             asyncio.run(resolver.resolve(config))
         mock_clear.assert_not_called()
 
-    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._ensure_image", new_callable=AsyncMock)
+    @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._pull_image", new_callable=AsyncMock)
     @patch("doozerlib.lockfile_prototype.resolver.RpmResolver._clear_rpmdb_cache")
     @patch("doozerlib.lockfile_prototype.resolver.cmd_gather_async")
     def test_no_retry_on_other_errors(self, mock_gather, mock_clear, mock_ensure):

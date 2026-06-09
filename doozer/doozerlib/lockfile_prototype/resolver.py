@@ -3,8 +3,8 @@ RPM resolution via rpm-lockfile-prototype container.
 
 Invokes the rpm-lockfile-prototype tool inside a podman container
 so that python3-dnf and all system dependencies are self-contained.
-The container image is built on demand from the bundled Containerfile
-if not already present locally.
+The container image is pulled from the art-cluster internal registry
+on first use if not already present locally.
 """
 
 import logging
@@ -22,7 +22,6 @@ from doozerlib.lockfile_prototype.constants import (
     CONTAINER_RPMDB_CACHE_PATH,
     DEFAULT_RPM_INFILE_NAME,
     DEFAULT_RPM_LOCKFILE_NAME,
-    RPM_LOCKFILE_CONTAINERFILE,
     RPM_LOCKFILE_IMAGE,
     RPMDB_CACHE_ERROR_PATTERNS,
     RPMDB_CACHE_PATH,
@@ -37,8 +36,8 @@ class RpmResolver:
     Maintains a persistent DNF repodata cache directory across
     resolve() calls so that repeated runs against the same repos
     (common during multi-image rebases) skip redundant downloads.
-    Builds the container image from the bundled Containerfile on
-    first use if not already present.
+    Pulls the container image from the art-cluster registry on
+    first use if not already present locally.
     """
 
     def __init__(self, logger: logging.Logger | None = None, cache_dir: str | None = None, image: str | None = None):
@@ -46,22 +45,30 @@ class RpmResolver:
         self._cache_dir_owner = None if cache_dir else TemporaryDirectory(prefix="rpm-lockfile-cache-")
         self._cache_path = cache_dir or self._cache_dir_owner.name
         self._image = image or RPM_LOCKFILE_IMAGE
+        self._image_pulled = False
 
-    async def _ensure_image(self) -> None:
+    async def _pull_image(self) -> None:
         """
-        Build the container image from the bundled Containerfile
-        if it does not already exist locally.
+        Pull the container image if not already present locally.
+        Uses RPM_LOCKFILE_IMAGE_PULLER_TOKEN env var for authentication
+        via --creds if available.
         """
+        if self._image_pulled:
+            return
         rc, _, _ = await cmd_gather_async(["podman", "image", "exists", self._image], check=False)
         if rc == 0:
+            self._image_pulled = True
             return
-        self.logger.info("Building rpm-lockfile-prototype container image: %s", self._image)
-        rc, _, stderr = await cmd_gather_async(
-            ["podman", "build", "-t", self._image, "-f", str(RPM_LOCKFILE_CONTAINERFILE), "."],
-            check=False,
-        )
+        cmd = ["podman", "pull"]
+        token = os.environ.get("RPM_LOCKFILE_IMAGE_PULLER_TOKEN")
+        if token:
+            cmd.extend(["--creds", f"rpm-lockfile-image-puller:{token}"])
+        cmd.append(self._image)
+        self.logger.info("Pulling rpm-lockfile-prototype container image: %s", self._image)
+        rc, _, stderr = await cmd_gather_async(cmd, check=False)
         if rc != 0:
-            raise RuntimeError(f"Failed to build {self._image}: {stderr}")
+            raise RuntimeError(f"Failed to pull {self._image}: {stderr}")
+        self._image_pulled = True
 
     def _build_podman_cmd(
         self,
@@ -82,16 +89,16 @@ class RpmResolver:
         # Work directory: rpms.in.yaml input and rpms.lock.yaml output
         cmd.extend(["-v", f"{tmpdir}:/work:Z"])
 
-        # DNF repodata cache
-        cmd.extend(["-v", f"{self._cache_path}:/cache:Z"])
+        # DNF repodata cache — :z (shared) so parallel resolve() calls can access
+        cmd.extend(["-v", f"{self._cache_path}:/cache:z"])
         cmd.extend(["-e", "RPM_LOCKFILE_PROTOTYPE_DNF_CACHE=/cache"])
 
         # RPMDB cache: host path → container /root/.cache/...
         RPMDB_CACHE_PATH.mkdir(parents=True, exist_ok=True)
-        cmd.extend(["-v", f"{RPMDB_CACHE_PATH}:{CONTAINER_RPMDB_CACHE_PATH}:Z"])
+        cmd.extend(["-v", f"{RPMDB_CACHE_PATH}:{CONTAINER_RPMDB_CACHE_PATH}:z"])
 
         # Mount host entitlement certs for accessing protected repos.
-        # Use :ro without :Z — SELinux won't allow relabeling system dirs.
+        # Use :ro without :z — SELinux won't allow relabeling system dirs.
         for host_path in ("/etc/pki/entitlement", "/etc/rhsm/ca", "/etc/pki/rpm-gpg"):
             if Path(host_path).is_dir():
                 cmd.extend(["-v", f"{host_path}:{host_path}:ro"])
@@ -99,7 +106,7 @@ class RpmResolver:
         # Registry auth
         auth_file = os.environ.get("QUAY_AUTH_FILE") or os.environ.get("REGISTRY_AUTH_FILE")
         if auth_file:
-            cmd.extend(["-v", f"{auth_file}:/auth/auth.json:ro,Z"])
+            cmd.extend(["-v", f"{auth_file}:/auth/auth.json:ro,z"])
             cmd.extend(["-e", "REGISTRY_AUTH_FILE=/auth/auth.json"])
 
         # Image name
@@ -133,7 +140,7 @@ class RpmResolver:
         Return Value(s):
             LockfileData: Resolved lockfile.
         """
-        await self._ensure_image()
+        await self._pull_image()
 
         with TemporaryDirectory() as tmpdir:
             in_file = Path(tmpdir) / DEFAULT_RPM_INFILE_NAME

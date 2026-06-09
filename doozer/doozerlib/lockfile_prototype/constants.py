@@ -18,8 +18,7 @@ LOCKFILE_VENDOR = "redhat"
 MAX_RESOLUTION_RETRIES = 5
 DEFAULT_PLATFORM = "linux/amd64"
 
-RPM_LOCKFILE_IMAGE = "localhost/rpm-lockfile-prototype:v0.22.0"
-RPM_LOCKFILE_CONTAINERFILE = Path(__file__).parent / "Containerfile"
+RPM_LOCKFILE_IMAGE = "default-route-openshift-image-registry.apps.artc2023.pc3z.p1.openshiftapps.com/hack-fgallott/rpm-lockfile-prototype:v0.22.0"
 CONTAINER_RPMDB_CACHE_PATH = Path("/root/.cache/rpm-lockfile-prototype/rpmdbs")
 
 # Shell subshell expressions that evaluate to the current architecture
