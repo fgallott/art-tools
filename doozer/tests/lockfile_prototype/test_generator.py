@@ -966,6 +966,42 @@ class TestCrossArchReconciliation(unittest.IsolatedAsyncioTestCase):
         result = RpmLockfilePrototypeGenerator._detect_cross_arch_mismatches(lockfile)
         self.assertEqual(result, {})
 
+    async def test_reconciliation_rejects_bare_update_package_missing_from_architecture(self):
+        """
+        Bare-update packages must be resolved for every target architecture.
+
+        A package present only on ppc64le and s390x must not be accepted as a
+        partial lockfile result for a four-architecture image.
+        """
+        gen = self._make_generator()
+        partial = self._make_lockfile(
+            {
+                "x86_64": [("curl", "7.76-1.el9", "https://x86/curl.rpm")],
+                "aarch64": [("curl", "7.76-1.el9", "https://arm/curl.rpm")],
+                "ppc64le": [
+                    ("curl", "7.76-1.el9", "https://ppc/curl.rpm"),
+                    ("kernel-headers", "5.14.0-687.47.1.el9_8", "https://ppc/kernel-headers.rpm"),
+                ],
+                "s390x": [
+                    ("curl", "7.76-1.el9", "https://s390x/curl.rpm"),
+                    ("kernel-headers", "5.14.0-687.47.1.el9_8", "https://s390x/kernel-headers.rpm"),
+                ],
+            }
+        )
+        gen._resolve_stage_with_retry = AsyncMock(return_value=partial)
+
+        with self.assertRaisesRegex(RuntimeError, "bare-update package coverage.*kernel-headers"):
+            await gen._resolve_with_reconciliation(
+                [],
+                ["x86_64", "aarch64", "ppc64le", "s390x"],
+                [],
+                None,
+                "test-image",
+                0,
+                upgrade_packages=["kernel-headers"],
+                required_upgrade_packages=["kernel-headers"],
+            )
+
     def test_compute_version_pins(self):
         mismatches = {
             "libeconf": {"x86_64": "0.4.1-7.el9_8", "aarch64": "0.4.1-5.el9"},
@@ -1478,7 +1514,17 @@ class TestBareUpdateUpgradeResolution(unittest.TestCase):
         container.read_file_from_image = AsyncMock(return_value="")
 
         resolver = MagicMock(spec=RpmResolver)
-        resolver.resolve = AsyncMock(return_value=FAKE_LOCKFILE_DATA.model_copy(deep=True))
+        bare_update_result = FAKE_LOCKFILE_DATA.model_copy(deep=True)
+        bare_update_result.arches[0].packages.extend(
+            PackageEntry(
+                url=f"https://example.com/{name}.x86_64.rpm",
+                repoid="rhel-9-baseos-rpms",
+                name=name,
+                evr="1.0-1.el9",
+            )
+            for name in ["glibc", "openssl", "rpm"]
+        )
+        resolver.resolve = AsyncMock(return_value=bare_update_result)
 
         generator = RpmLockfilePrototypeGenerator(
             repos=self._make_mock_repos(),
@@ -1508,6 +1554,7 @@ class TestBareUpdateUpgradeResolution(unittest.TestCase):
         calls = resolver.resolve.call_args_list
         self.assertGreaterEqual(len(calls), 1)
         first_config = calls[0].args[0]
+        self.assertTrue(all(isinstance(package, str) for package in first_config.upgradePackages))
         upgrade_names = [
             package if isinstance(package, str) else package.name for package in first_config.upgradePackages
         ]
@@ -1603,6 +1650,48 @@ class TestBareUpdateUpgradeResolution(unittest.TestCase):
         # First call fails (glibc in upgradePackages), second succeeds without them
         self.assertEqual(call_count, 2)
 
+    def test_required_bare_update_package_failure_is_not_dropped(self):
+        """Required bare-update packages must fail instead of being dropped."""
+        call_count = 0
+
+        async def mock_resolve(config, image_pullspec=None, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("No match for argument: kernel-headers")
+
+        container = MagicMock(spec=ContainerImageHelper)
+        container.resolve_to_digest = AsyncMock(side_effect=lambda p: p)
+        container.get_installed_packages = AsyncMock(return_value=[])
+        container.read_file_from_image = AsyncMock(return_value="")
+
+        resolver = MagicMock(spec=RpmResolver)
+        resolver.resolve = AsyncMock(side_effect=mock_resolve)
+        generator = RpmLockfilePrototypeGenerator(
+            repos=self._make_mock_repos(),
+            working_dir=Path(tempfile.mkdtemp()),
+            container_helper=container,
+            resolver=resolver,
+        )
+
+        repos = [RepoEntry(repoid="baseos", baseurl="https://example.com/$basearch/")]
+
+        with self.assertRaisesRegex(RuntimeError, "required bare-update packages"):
+            asyncio.run(
+                generator._resolve_stage_with_retry(
+                    repo_list=repos,
+                    arches=["x86_64", "aarch64"],
+                    packages=[],
+                    image_pullspec="quay.io/test/base@sha256:abc123",
+                    distgit_key="test-image",
+                    stage_num=0,
+                    upgrade_packages=["kernel-headers"],
+                    required_upgrade_packages=["kernel-headers"],
+                )
+            )
+
+        self.assertEqual(call_count, 1)
+        self.assertFalse(generator.upgrades_dropped)
+
     def test_bare_update_final_stage_disables_reinstall(self):
         """
         When the final stage has a bare dnf update, reinstallPackages
@@ -1615,7 +1704,17 @@ class TestBareUpdateUpgradeResolution(unittest.TestCase):
         container.read_file_from_image = AsyncMock(return_value="")
 
         resolver = MagicMock(spec=RpmResolver)
-        resolver.resolve = AsyncMock(return_value=FAKE_LOCKFILE_DATA.model_copy(deep=True))
+        bare_update_result = FAKE_LOCKFILE_DATA.model_copy(deep=True)
+        bare_update_result.arches[0].packages.extend(
+            PackageEntry(
+                url=f"https://example.com/{name}.x86_64.rpm",
+                repoid="rhel-9-baseos-rpms",
+                name=name,
+                evr="1.0-1.el9",
+            )
+            for name in ["glibc", "openssl"]
+        )
+        resolver.resolve = AsyncMock(return_value=bare_update_result)
 
         generator = RpmLockfilePrototypeGenerator(
             repos=self._make_mock_repos(),

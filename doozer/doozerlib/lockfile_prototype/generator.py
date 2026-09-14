@@ -81,6 +81,30 @@ def _package_key(package: str | ArchSpecificPackage) -> tuple[str, tuple[tuple[s
     return package.name, tuple(sorted(package.arches.items()))
 
 
+def _unscoped_package_names(packages: list[str | ArchSpecificPackage]) -> list[str]:
+    """
+    Convert package specifications to unique, architecture-independent names.
+
+    Bare package-manager updates apply to every target architecture. This
+    helper removes the architecture scopes created while collecting packages
+    from a multi-arch base image so the resolver cannot silently perform a
+    partial update.
+
+    Arg(s):
+        packages (list[str | ArchSpecificPackage]): Package specifications.
+    Return Value(s):
+        list[str]: Unique package names in their first-seen order.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for package in packages:
+        name = _package_name(package)
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
+
+
 _BARE_UPDATE_RE = re.compile(
     r"\b(?:microdnf|dnf|yum)\s+(?:-y\s+)?(?:update|upgrade)(?:\s+-y)?\s*(?:\\\n\s*&&\s*|&&\s*|;\s*|\n|(?=$))"
 )
@@ -601,6 +625,14 @@ class RpmLockfilePrototypeGenerator:
                         "packages added as upgrade targets for bare update"
                     )
 
+            requires_all_arches = stage_num in stages_with_bare_updates and not bare_context
+            if requires_all_arches and upgrade_pkgs:
+                upgrade_pkgs = _unscoped_package_names(upgrade_pkgs)
+                self.logger.info(
+                    f"{distgit_key}: stage {stage_num}: bare-update targets require resolution "
+                    f"across all architectures: {len(upgrade_pkgs)} packages"
+                )
+
             result = await self._resolve_with_reconciliation(
                 repo_list,
                 arches,
@@ -612,6 +644,7 @@ class RpmLockfilePrototypeGenerator:
                 containerfile_path=str(dockerfile_path),
                 upgrade_packages=upgrade_pkgs,
                 bare_context=bare_context,
+                required_upgrade_packages=upgrade_pkgs if requires_all_arches else None,
             )
 
             # Pass 2: pin Dockerfile packages that overlap with the base
@@ -804,6 +837,7 @@ class RpmLockfilePrototypeGenerator:
         containerfile_path: str | None = None,
         upgrade_packages: list[str | ArchSpecificPackage] | None = None,
         bare_context: bool = False,
+        required_upgrade_packages: list[str] | None = None,
     ) -> LockfileData | None:
         """
         Resolve a single stage, retrying after removing unavailable packages.
@@ -826,6 +860,8 @@ class RpmLockfilePrototypeGenerator:
             upgrade_packages (list[str | ArchSpecificPackage] | None): Base image packages to
                 upgrade (from bare dnf/yum update commands).
             bare_context (bool): Whether to emit a bare resolution context.
+            required_upgrade_packages (list[str] | None): Bare-update packages
+                that must resolve for every target architecture.
         Return Value(s):
             LockfileData | None: Lockfile data, or None if all packages filtered out.
         """
@@ -898,6 +934,12 @@ class RpmLockfilePrototypeGenerator:
                 upgrade_names = {_package_name(package) for package in remaining_upgrade}
                 upgrade_hit = missing & upgrade_names if remaining_upgrade else set()
                 if upgrade_hit:
+                    required_hit = upgrade_hit & set(required_upgrade_packages or [])
+                    if required_hit:
+                        raise RuntimeError(
+                            f"{distgit_key}: stage {stage_num}: required bare-update packages "
+                            f"could not be resolved for every target architecture: {sorted(required_hit)}"
+                        ) from e
                     self.logger.info(
                         f"{distgit_key}: stage {stage_num}: dropping all "
                         f"{len(remaining_upgrade)} bare-update upgrade packages "
@@ -992,6 +1034,45 @@ class RpmLockfilePrototypeGenerator:
                 arch_entry.module_metadata = merged_modules
 
     @staticmethod
+    def _detect_missing_required_packages(
+        lockfile: LockfileData,
+        arches: list[str],
+        required_packages: list[str],
+    ) -> dict[str, list[str]]:
+        """
+        Find required packages absent from one or more architecture results.
+
+        Arg(s):
+            lockfile (LockfileData): Resolved lockfile to inspect.
+            arches (list[str]): Target architectures that must be covered.
+            required_packages (list[str]): Package names required on every
+                architecture.
+        Return Value(s):
+            dict[str, list[str]]: Package names mapped to missing arches.
+        """
+        packages_by_arch = {
+            arch_entry.arch: {package.name for package in arch_entry.packages if package.name}
+            for arch_entry in lockfile.arches
+        }
+        return {
+            package: [arch for arch in arches if package not in packages_by_arch.get(arch, set())]
+            for package in required_packages
+            if any(package not in packages_by_arch.get(arch, set()) for arch in arches)
+        }
+
+    @staticmethod
+    def _format_missing_required_packages(missing: dict[str, list[str]]) -> str:
+        """
+        Format required package coverage gaps for an error message.
+
+        Arg(s):
+            missing (dict[str, list[str]]): Packages mapped to missing arches.
+        Return Value(s):
+            str: Human-readable package coverage details.
+        """
+        return "; ".join(f"{name} (missing on {', '.join(arches)})" for name, arches in sorted(missing.items()))
+
+    @staticmethod
     def _detect_cross_arch_mismatches(lockfile: LockfileData) -> dict[str, dict[str, str]]:
         """
         Detect packages with different EVR versions across architectures.
@@ -1022,7 +1103,11 @@ class RpmLockfilePrototypeGenerator:
     def _compute_version_pins(mismatches: dict[str, dict[str, str]]) -> list[str]:
         """
         Compute version-pinned DNF package specs from cross-arch mismatches.
-        Picks the minimum (oldest) version for each package.
+        Picks the minimum of the per-architecture resolved versions. Since
+        each first-pass result is the newest version available on that
+        architecture, this is the newest version candidate common to all
+        architectures. The second resolution verifies that candidate exists
+        everywhere.
 
         Arg(s):
             mismatches (dict[str, dict[str, str]]): From _detect_cross_arch_mismatches.
@@ -1059,6 +1144,7 @@ class RpmLockfilePrototypeGenerator:
         containerfile_path: str | None = None,
         upgrade_packages: list[str | ArchSpecificPackage] | None = None,
         bare_context: bool = False,
+        required_upgrade_packages: list[str] | None = None,
     ) -> LockfileData | None:
         """
         Resolve a stage with cross-arch version reconciliation.
@@ -1081,6 +1167,8 @@ class RpmLockfilePrototypeGenerator:
             upgrade_packages (list[str | ArchSpecificPackage] | None): Base image packages to
                 upgrade (from bare dnf/yum update commands).
             bare_context (bool): Whether to emit a bare resolution context.
+            required_upgrade_packages (list[str] | None): Bare-update packages
+                that must resolve for every target architecture.
         Return Value(s):
             LockfileData | None: Resolved lockfile with consistent
                 versions, or None if no packages remain.
@@ -1096,9 +1184,27 @@ class RpmLockfilePrototypeGenerator:
             containerfile_path=containerfile_path,
             upgrade_packages=upgrade_packages,
             bare_context=bare_context,
+            required_upgrade_packages=required_upgrade_packages,
         )
         if not first_pass:
+            if required_upgrade_packages:
+                raise RuntimeError(
+                    f"{distgit_key}: stage {stage_num}: required bare-update packages "
+                    "produced no lockfile result: "
+                    f"{sorted(set(required_upgrade_packages))}"
+                )
             return None
+
+        missing_required = self._detect_missing_required_packages(
+            first_pass,
+            arches,
+            required_upgrade_packages or [],
+        )
+        if missing_required:
+            raise RuntimeError(
+                f"{distgit_key}: stage {stage_num}: bare-update package coverage is incomplete: "
+                f"{self._format_missing_required_packages(missing_required)}"
+            )
 
         mismatches = self._detect_cross_arch_mismatches(first_pass)
         if not mismatches:
@@ -1137,6 +1243,7 @@ class RpmLockfilePrototypeGenerator:
                 containerfile_path=containerfile_path,
                 upgrade_packages=pinned_upgrade,
                 bare_context=bare_context,
+                required_upgrade_packages=required_upgrade_packages,
             )
         except RuntimeError as e:
             raise RuntimeError(
@@ -1150,6 +1257,17 @@ class RpmLockfilePrototypeGenerator:
                 f"{distgit_key}: stage {stage_num}: cross-arch version reconciliation failed. "
                 f"Re-resolution returned no results. "
                 f"Mismatched packages: {self._format_mismatches(mismatches)}"
+            )
+
+        remaining_missing = self._detect_missing_required_packages(
+            second_pass,
+            arches,
+            required_upgrade_packages or [],
+        )
+        if remaining_missing:
+            raise RuntimeError(
+                f"{distgit_key}: stage {stage_num}: bare-update package coverage is incomplete "
+                f"after version reconciliation: {self._format_missing_required_packages(remaining_missing)}"
             )
 
         remaining = self._detect_cross_arch_mismatches(second_pass)
