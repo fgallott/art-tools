@@ -1,26 +1,38 @@
 """
 Collect and report health information for layered-product image groups.
 
-The command in this module is intentionally separate from the OCP and OKD
-image-health pipelines because layered products use product-specific build
-variants and an aggregated Slack report.
+Collection and report formatting use shared image-health helpers while this
+module handles product-specific variants and an aggregated Slack report.
 """
 
 import asyncio
-import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 
 import click
 from artcommonlib import exectools
 from artcommonlib.variants import BuildVariant, get_build_variant_for_product
-from doozerlib.cli.images_health import DELTA_DAYS, LIMIT_BUILD_RESULTS, ConcernCode
-from doozerlib.constants import ART_BUILD_FAILURES_URL, ART_BUILD_HISTORY_URL
+from doozerlib.constants import ART_BUILD_FAILURES_URL
 
 from pyartcd import util
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.constants import OCP_BUILD_DATA_URL
+from pyartcd.pipelines.image_health_common import (
+    build_group_param,
+    build_history_url,
+    build_logs_url,
+    filter_failure_concerns,
+    filter_failure_map,
+    filter_image_list,
+    filter_image_names,
+    format_build_concern_line,
+    format_counter_failure_section,
+    format_rebase_failure_section,
+    get_counter_failures,
+    get_rebase_failures,
+    get_valid_images_from_group,
+    run_images_health,
+    slack_url_text,
+)
 from pyartcd.runtime import Runtime
 from pyartcd.slack import SlackClient
 
@@ -155,38 +167,52 @@ class LayeredProductsImageHealthPipeline:
         variant = get_build_variant_for_product(product)
 
         build_failures, its_failures, release_failures, rebase_failures = await asyncio.gather(
-            util.get_counter_failures(
+            get_counter_failures(
                 "build-failure",
-                group=group,
-                logger=self.runtime.logger,
+                group,
+                self.runtime.logger,
                 build_variant=variant.value,
             ),
-            util.get_counter_failures(
+            get_counter_failures(
                 "ec-failure",
-                group=group,
-                logger=self.runtime.logger,
+                group,
+                self.runtime.logger,
                 build_variant=variant.value,
             ),
-            util.get_counter_failures(
+            get_counter_failures(
                 "release-failure",
-                group=group,
-                logger=self.runtime.logger,
+                group,
+                self.runtime.logger,
                 build_variant=variant.value,
             ),
-            util.get_rebase_failures(
-                group=group,
-                branches=["rebase-failure"],
+            get_rebase_failures(
+                group,
+                self.runtime.logger,
                 build_systems=["konflux"],
                 build_variant=variant.value,
-                logger=self.runtime.logger,
             ),
         )
 
         failure_images = set(build_failures) | set(its_failures) | set(release_failures)
-        if self.image_list:
-            failure_images &= set(self.image_list)
+        valid_images = set()
+        if failure_images or rebase_failures:
+            valid_images = await self._get_valid_images(group, variant)
+            build_failures = filter_failure_map(
+                build_failures, valid_images, group, self.runtime.logger, "build failure"
+            )
+            its_failures = filter_failure_map(its_failures, valid_images, group, self.runtime.logger, "ec failure")
+            release_failures = filter_failure_map(
+                release_failures, valid_images, group, self.runtime.logger, "release failure"
+            )
+            rebase_failures = filter_failure_map(
+                rebase_failures, valid_images, group, self.runtime.logger, "rebase failure"
+            )
 
-        build_concerns = await self._get_build_concerns(group, variant, failure_images)
+        failure_images = filter_image_list(
+            set(build_failures) | set(its_failures) | set(release_failures), set(self.image_list)
+        )
+
+        build_concerns = await self._get_build_concerns(group, variant, failure_images, valid_images)
         return LayeredProductHealthReport(
             group=group,
             product=product,
@@ -203,6 +229,7 @@ class LayeredProductsImageHealthPipeline:
         group: str,
         variant: BuildVariant,
         image_names: set[str],
+        valid_images: set[str] | None = None,
     ) -> list[dict]:
         """
         Return build concerns for affected images.
@@ -218,28 +245,24 @@ class LayeredProductsImageHealthPipeline:
         if not image_names:
             return []
 
-        valid_images = await self._get_valid_images(group, variant)
-        filtered_images = image_names & valid_images
+        if valid_images is None:
+            valid_images = await self._get_valid_images(group, variant)
+        filtered_images = filter_image_names(image_names, valid_images, group, self.runtime.logger)
         if not filtered_images:
             return []
 
-        group_param = group
-        if self.data_gitref:
-            group_param += f"@{self.data_gitref}"
         working_dir = self._doozer_working / group
         command = [
             "doozer",
             f"--working-dir={working_dir}",
             f"--data-path={self.data_path}",
-            f"--group={group_param}",
+            build_group_param(group, self.data_gitref),
             f"--assembly={self.assembly}",
             "--build-system=konflux",
             f"--variant={variant.value}",
-            f"--images={','.join(sorted(filtered_images))}",
-            "images:health",
         ]
-        _, output, _ = await exectools.cmd_gather_async(command, stderr=None)
-        return json.loads(output.strip()) if output.strip() else []
+        report, _ = await run_images_health(command, filtered_images, command_runner=exectools.cmd_gather_async)
+        return report
 
     async def _get_valid_images(self, group: str, variant: BuildVariant) -> set[str]:
         """
@@ -252,16 +275,15 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             Image names available in the selected group and variant.
         """
-        images = await util.get_group_images(
+        return await get_valid_images_from_group(
             group=group,
             assembly=self.assembly,
             build_system="konflux",
             working_dir=self._doozer_working / group,
-            doozer_data_path=self.data_path,
-            doozer_data_gitref=self.data_gitref,
+            data_path=self.data_path,
+            data_gitref=self.data_gitref,
             variant=variant.value,
         )
-        return set(images)
 
     def _build_summary_message(self, reports: list[LayeredProductHealthReport]) -> str:
         """
@@ -325,7 +347,14 @@ class LayeredProductsImageHealthPipeline:
         if report.release_failures:
             sections.append(self._format_counter_section("Release to Authz Failures", report.release_failures))
         if report.rebase_failures:
-            sections.append(self._format_counter_section("Rebase Failures", report.rebase_failures))
+            sections.append(
+                format_rebase_failure_section(
+                    report.rebase_failures,
+                    self._url_text,
+                    "Last failure",
+                    include_pipeline_url=True,
+                )
+            )
         if len(sections) == 1:
             sections.append(":white_check_mark: Healthy")
         return "\n\n".join(sections)
@@ -363,7 +392,7 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             Concerns representing a failed or never-built image.
         """
-        return [concern for concern in concerns if concern.get("code") != ConcernCode.LATEST_BUILD_SUCCEEDED.value]
+        return filter_failure_concerns(concerns)
 
     def _format_build_concern(self, concern: dict, group: str) -> str:
         """
@@ -376,20 +405,12 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             Slack-formatted build concern line.
         """
-        image_name = concern["image_name"]
-        code = concern.get("code")
-        if code == ConcernCode.NEVER_BUILT.value:
-            return f"- `{image_name}`: No builds attempted during last {DELTA_DAYS} days"
-
-        line = f"- `{image_name}`: {self._url_text(self._build_history_url(group, image_name), 'Build history')}"
-        logs_url = self._build_logs_url(concern)
-        if logs_url:
-            line += f" | {self._url_text(logs_url, 'Latest failure logs')}"
-        if code == ConcernCode.FAILING_AT_LEAST_FOR.value:
-            line += f" - Failing for at least {LIMIT_BUILD_RESULTS} attempts"
-        else:
-            line += f" - Latest attempt failed ({concern.get('latest_success_idx', '?')} attempts since last success)"
-        return line
+        return format_build_concern_line(
+            concern,
+            lambda: self._build_history_url(group, concern["image_name"]),
+            lambda: self._build_logs_url(concern),
+            self._url_text,
+        )
 
     @staticmethod
     def _format_counter_section(title: str, failures: dict[str, dict]) -> str:
@@ -403,16 +424,7 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             Slack-formatted counter section.
         """
-        lines = [f"*{title} ({len(failures)}):*"]
-        for image_name, failure in sorted(failures.items()):
-            count = failure.get("failure_count", 0)
-            suffix = "" if count == 1 else "s"
-            line = f"- `{image_name}`: Failed {count} time{suffix}"
-            url = failure.get("pipeline_url") or failure.get("jenkins_url")
-            if url:
-                line += f" ({LayeredProductsImageHealthPipeline._url_text(url, 'Last failure')})"
-            lines.append(line)
-        return "\n".join(lines)
+        return format_counter_failure_section(title, failures, LayeredProductsImageHealthPipeline._url_text)
 
     def _build_history_url(self, group: str, image_name: str) -> str:
         """
@@ -425,12 +437,7 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             ART build-history search URL.
         """
-        start_date = (datetime.now(timezone.utc) - timedelta(days=DELTA_DAYS)).strftime("%Y-%m-%d")
-        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        return (
-            f"{ART_BUILD_HISTORY_URL}/?name=^{image_name}$&group={group}&assembly={self.assembly}"
-            f"&engine=konflux&dateRange={start_date}+to+{end_date}&outcome=Success&outcome=Failure"
-        )
+        return build_history_url(image_name, group, self.assembly)
 
     @staticmethod
     def _build_logs_url(concern: dict) -> str:
@@ -443,14 +450,7 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             ART logs URL or an empty string when metadata is incomplete.
         """
-        nvr = concern.get("latest_failed_nvr")
-        record_id = concern.get("latest_failed_build_record_id")
-        failed_time = concern.get("latest_failed_build_time")
-        if not nvr or not record_id or not failed_time:
-            return ""
-        timestamp = datetime.fromisoformat(str(failed_time)).astimezone(timezone.utc)
-        formatted = timestamp.strftime("%a, %d %b %Y %H:%M:%S GMT")
-        return f"{ART_BUILD_HISTORY_URL}/logs?nvr={nvr}&record_id={record_id}&after={quote(formatted)}"
+        return build_logs_url(concern, encode_after=True, strict=False)
 
     @staticmethod
     def _url_text(url: str, text: str) -> str:
@@ -464,7 +464,7 @@ class LayeredProductsImageHealthPipeline:
         Returns:
             Slack link markup.
         """
-        return f"<{quote(url, safe=':/?&=+%.-')}|{text}>"
+        return slack_url_text(url, text)
 
 
 @cli.command("layered-products-image-health")

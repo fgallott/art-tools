@@ -1,18 +1,32 @@
 import asyncio
-import json
-from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import quote
 
 import click
 from artcommonlib import exectools
 from artcommonlib.constants import ACTIVE_OCP_VERSIONS
-from doozerlib.cli.images_health import DELTA_DAYS, LIMIT_BUILD_RESULTS, ConcernCode
-from doozerlib.constants import ART_BUILD_FAILURES_URL, ART_BUILD_HISTORY_URL
+from doozerlib.cli.images_health import LIMIT_BUILD_RESULTS, ConcernCode
+from doozerlib.constants import ART_BUILD_FAILURES_URL
 
 from pyartcd import util
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.constants import OCP_BUILD_DATA_URL
+from pyartcd.pipelines.image_health_common import (
+    build_group_param,
+    build_history_url,
+    build_logs_url,
+    filter_failure_concerns,
+    filter_image_list,
+    filter_image_names,
+    format_build_concern_line,
+    format_rebase_failure_section,
+    get_counter_failures,
+    get_filtered_rebase_failures,
+    get_multi_failure_images,
+    get_multi_rebase_failures,
+    get_valid_images_from_doozer,
+    run_images_health,
+    slack_url_text,
+)
 from pyartcd.runtime import Runtime
 
 OKD_GROUP_TEMPLATE = "okd-{}"
@@ -111,11 +125,9 @@ class ImagesHealthPipeline:
 
     async def get_report(self, version: str) -> Optional[list]:
         group = OKD_GROUP_TEMPLATE.format(version)
-        failures = await util.get_counter_failures('build-failure', group=group, logger=self.runtime.logger)
+        failures = await get_counter_failures('build-failure', group, self.runtime.logger)
 
-        failing_images = set(failures.keys())
-        if self.image_list:
-            failing_images &= set(self.image_list)
+        failing_images = filter_image_list(set(failures), set(self.image_list))
 
         if not failing_images:
             self.runtime.logger.info('No build failures in Redis for %s; skipping BigQuery scan', group)
@@ -125,16 +137,7 @@ class ImagesHealthPipeline:
         # Filter failing_images to only include images that exist in current ocp-build-data
         doozer_working = f'{self.doozer_working}-{version}'
         valid_images = await self._get_valid_images(version, doozer_working)
-        filtered_failing_images = failing_images & valid_images
-        skipped_images = failing_images - valid_images
-
-        if skipped_images:
-            self.runtime.logger.warning(
-                'Filtered out %d image(s) from Redis that do not exist in %s metadata: %s',
-                len(skipped_images),
-                group,
-                ', '.join(sorted(skipped_images)),
-            )
+        filtered_failing_images = filter_image_names(failing_images, valid_images, group, self.runtime.logger)
 
         if not filtered_failing_images:
             self.runtime.logger.info(
@@ -149,26 +152,24 @@ class ImagesHealthPipeline:
             group,
         )
 
-        group_param = f'--group=openshift-{version}'
-        if self.data_gitref:
-            group_param += f'@{self.data_gitref}'
-
         cmd = [
             'doozer',
             f'--working-dir={doozer_working}',
             f'--data-path={self.data_path}',
             '--variant=okd',
-            group_param,
-            f'--images={",".join(sorted(filtered_failing_images))}',
-            'images:health',
-            f'--group={group}',
+            build_group_param(f'openshift-{version}', self.data_gitref),
         ]
 
+        after_command = [f'--group={group}']
         if self.assembly:
-            cmd.append(f'--assembly={self.assembly}')
+            after_command.append(f'--assembly={self.assembly}')
 
-        _, out, err = await exectools.cmd_gather_async(cmd, stderr=None)
-        report = json.loads(out.strip())
+        report, out = await run_images_health(
+            cmd,
+            filtered_failing_images,
+            tuple(after_command),
+            command_runner=exectools.cmd_gather_async,
+        )
 
         self.runtime.logger.info('images:health output for %s:\n%s', group, out)
         self.report.extend(report)
@@ -183,37 +184,12 @@ class ImagesHealthPipeline:
         Arg(s):
             version (str): OKD version (e.g., "4.21")
         """
-        # Fetch all rebase failures from Redis
         group = f'okd-{version}'
-        all_failures = await util.get_rebase_failures(
-            group=group,
-            branches=['rebase-failure'],
-            build_systems=['konflux'],
-            logger=self.runtime.logger,
-        )
-
-        # Get list of valid images for this version from metadata
         doozer_working = f'{self.doozer_working}-{version}'
         valid_images = await self._get_valid_images(version, doozer_working)
-
-        # Filter to only include images that exist in metadata
-        filtered_failures = {}
-        skipped_images = []
-
-        for image_name, failure_info in all_failures.items():
-            if image_name in valid_images:
-                filtered_failures[image_name] = failure_info
-            else:
-                skipped_images.append(image_name)
-
-        if skipped_images:
-            self.runtime.logger.warning(
-                'Filtered out %d rebase failure(s) from Redis that do not exist in okd-%s metadata: %s',
-                len(skipped_images),
-                version,
-                ', '.join(sorted(skipped_images)),
-            )
-
+        filtered_failures = await get_filtered_rebase_failures(
+            group, valid_images, self.runtime.logger, ['konflux']
+        )
         self.rebase_failures[version] = filtered_failures
 
     async def _get_valid_images(self, version: str, doozer_working: str) -> set[str]:
@@ -226,33 +202,14 @@ class ImagesHealthPipeline:
         Return Value(s):
             set[str]: Set of valid image distgit keys
         """
-        group_param = f'--group=openshift-{version}'
-        if self.data_gitref:
-            group_param += f'@{self.data_gitref}'
-
-        cmd = [
-            'doozer',
-            f'--working-dir={doozer_working}',
-            f'--data-path={self.data_path}',
-            '--variant=okd',
-            group_param,
-            'images:print',
-            '--short',
-            '{distgit_key}',
-        ]
-
-        try:
-            _, out, _ = await exectools.cmd_gather_async(cmd, stderr=None)
-            # Parse the output - one image name per line
-            valid_images = {line.strip() for line in out.strip().split('\n') if line.strip()}
-            self.runtime.logger.info('Found %d valid OKD images for openshift-%s', len(valid_images), version)
-            return valid_images
-        except Exception as e:
-            self.runtime.logger.warning(
-                'Failed to fetch valid OKD images for openshift-%s: %s. Proceeding without filtering.', version, e
-            )
-            # On failure, return empty set to fail safe (don't process any images from Redis)
-            return set()
+        return await get_valid_images_from_doozer(
+            self.runtime,
+            group=f'openshift-{version}',
+            working_dir=doozer_working,
+            data_path=self.data_path,
+            data_gitref=self.data_gitref,
+            variant='okd',
+        )
 
     async def notify_release_channel(self, version):
         """
@@ -271,10 +228,7 @@ class ImagesHealthPipeline:
 
         # Filter concerns for this version, excluding successful builds
         concerns = [
-            concern
-            for concern in self.report
-            if concern.get('group', '') == f'openshift-{version}'
-            and concern['code'] != ConcernCode.LATEST_BUILD_SUCCEEDED.value
+            concern for concern in filter_failure_concerns(self.report) if concern.get('group') == f'openshift-{version}'
         ]
 
         # Get rebase failures for this version
@@ -315,14 +269,7 @@ class ImagesHealthPipeline:
 
         # Add rebase failures
         if rebase_failures:
-            report += '*Rebase Failures:*\n'
-            for image_name, failure_info in sorted(rebase_failures.items()):
-                failure_count = failure_info.get('failure_count', 0)
-                jenkins_url = failure_info.get('jenkins_url', '')
-                report += f'- `{image_name}`: Failed {failure_count} time{"s" if failure_count != 1 else ""}'
-                if jenkins_url:
-                    report += f' ({self.url_text(jenkins_url, "Last failure job")})'
-                report += '\n'
+            report += format_rebase_failure_section(rebase_failures, self.url_text)
 
         await self.slack_client.say(report, thread_ts=response['ts'])
 
@@ -400,29 +347,12 @@ class ImagesHealthPipeline:
         Return Value(s):
             str: Formatted message with links and details
         """
-        code = concern['code']
-        image_name = concern['image_name']
-
-        # No build history link if never built
-        if code == ConcernCode.NEVER_BUILT.value:
-            return f'- `{image_name}`: No builds attempted during last {DELTA_DAYS} days'
-
-        # Include search page link for this component
-        search_url = self.get_search_url(concern)
-        message = f'- `{image_name}`: {self.url_text(search_url, "Build history")}'
-
-        # Add logs link for failures
-        if code in [ConcernCode.LATEST_ATTEMPT_FAILED.value, ConcernCode.FAILING_AT_LEAST_FOR.value]:
-            logs_url = self.get_logs_url(concern)
-            message += f' | {self.url_text(logs_url, "Latest failure logs")}'
-
-        if code == ConcernCode.FAILING_AT_LEAST_FOR.value:
-            message += f' - Failing for at least {LIMIT_BUILD_RESULTS} attempts'
-            return message
-
-        # ConcernCode.LATEST_ATTEMPT_FAILED
-        message += f' - Latest attempt failed ({concern["latest_success_idx"]} attempts since last success)'
-        return message
+        return format_build_concern_line(
+            concern,
+            lambda: self.get_search_url(concern),
+            lambda: self.get_logs_url(concern),
+            self.url_text,
+        )
 
     def get_message_for_okd_channel(self, concern: dict):
         """
@@ -439,9 +369,7 @@ class ImagesHealthPipeline:
         # Transform openshift-X.Y to okd-X.Y for display
         okd_group = group.replace('openshift-', 'okd-')
 
-        start_date = (datetime.now(timezone.utc) - timedelta(days=DELTA_DAYS)).strftime('%Y-%m-%d')
-        end_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        art_dash_link = f'{ART_BUILD_HISTORY_URL}/?name=^{concern["image_name"]}$&group={okd_group}&assembly=stream&engine=konflux&dateRange={start_date}+to+{end_date}&outcome=Success&outcome=Failure'
+        art_dash_link = build_history_url(concern['image_name'], okd_group, 'stream')
         logs_link = self.url_text(self.get_logs_url(concern), "logs")
 
         message = f'{self.url_text(art_dash_link, f"{okd_group}")}: '
@@ -467,9 +395,7 @@ class ImagesHealthPipeline:
         group = concern['group']
         # Transform openshift-X.Y to okd-X.Y for the OKD dashboard
         okd_group = group.replace('openshift-', 'okd-')
-        start_date = (datetime.now(timezone.utc) - timedelta(days=DELTA_DAYS)).strftime('%Y-%m-%d')
-        end_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        return f'{ART_BUILD_HISTORY_URL}/?name=^{image_name}$&group={okd_group}&assembly=stream&engine=konflux&dateRange={start_date}+to+{end_date}&outcome=Success&outcome=Failure'
+        return build_history_url(image_name, okd_group, 'stream')
 
     @staticmethod
     def get_logs_url(concern):
@@ -481,10 +407,7 @@ class ImagesHealthPipeline:
         Return Value(s):
             str: URL to the build logs
         """
-        dt = datetime.fromisoformat(concern['latest_failed_build_time'])
-        formatted = dt.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        logs_url = f'{ART_BUILD_HISTORY_URL}/logs?nvr={concern["latest_failed_nvr"]}&record_id={concern["latest_failed_build_record_id"]}&after={formatted}'
-        return logs_url
+        return build_logs_url(concern, encode_after=False)
 
     @staticmethod
     def get_component_tag(report):
@@ -515,9 +438,7 @@ class ImagesHealthPipeline:
             str: Slack-formatted link <url|text>
         """
         try:
-            safe_chars = ":/?&=+%.-"  # keep URL structure intact
-            safe_url = quote(url, safe=safe_chars)
-            return f"<{safe_url}|{text}>"
+            return slack_url_text(url, text)
 
         except Exception as e:
             self.runtime.logger.warning('invalid URL: %s', e)
@@ -531,26 +452,7 @@ class ImagesHealthPipeline:
         Return Value(s):
             dict[str, list[dict]]: Version -> list of failing concerns
         """
-        multi_failures = {}
-        for concern in self.report:
-            code = concern['code']
-            # Skip concerns that aren't actual failures
-            if code not in [ConcernCode.LATEST_ATTEMPT_FAILED.value, ConcernCode.FAILING_AT_LEAST_FOR.value]:
-                continue
-
-            # Only include images with >1 consecutive failure
-            if concern.get('latest_success_idx', 0) <= 1:
-                continue
-
-            # Extract version from group (openshift-4.21 -> 4.21)
-            group = concern.get('group', '')
-            version = group.replace('openshift-', '')
-
-            if version not in multi_failures:
-                multi_failures[version] = []
-            multi_failures[version].append(concern)
-
-        return multi_failures
+        return get_multi_failure_images(self.report)
 
     def _get_multi_rebase_failures(self) -> dict[str, dict[str, dict]]:
         """
@@ -559,12 +461,7 @@ class ImagesHealthPipeline:
         Return Value(s):
             dict[str, dict[str, dict]]: Version -> {image_name: failure_info}
         """
-        result = {}
-        for version, failures in self.rebase_failures.items():
-            multi = {image: info for image, info in failures.items() if info.get('failure_count', 0) > 1}
-            if multi:
-                result[version] = multi
-        return result
+        return get_multi_rebase_failures(self.rebase_failures)
 
     def _build_chai_bot_prompt(
         self, version: str, failing_concerns: list[dict], rebase_failures: dict[str, dict] | None = None
