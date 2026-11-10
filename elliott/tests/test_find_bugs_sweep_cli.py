@@ -6,6 +6,12 @@ import elliottlib.cli.find_bugs_sweep_cli as sweep_cli
 from artcommonlib.constants import SHIPMENT_DATA_URL_TEMPLATE
 from click.testing import CliRunner
 from elliottlib import constants, errata
+from elliottlib.bug_sweep_plugins.contracts import (
+    PluginDecision,
+    PluginDisposition,
+    PluginEvaluation,
+    PluginResult,
+)
 from elliottlib.bzutil import JIRABugTracker
 from elliottlib.cli.common import Runtime, cli
 from elliottlib.cli.find_bugs_sweep_cli import (
@@ -142,6 +148,7 @@ class FindBugsSweepTestCase(unittest.IsolatedAsyncioTestCase):
         bug_tracker = MagicMock(type="jira")
         bug_tracker.get_bugs = Mock(return_value=[included_bug])
         runtime = MagicMock(debug=False)
+        runtime.get_bug_config.return_value = {}
 
         actual = await sweep_cli.get_bugs_sweep(runtime, find_bugs_obj, bug_tracker)
 
@@ -161,6 +168,7 @@ class FindBugsSweepTestCase(unittest.IsolatedAsyncioTestCase):
         find_bugs_obj = sweep_cli.FindBugsSweep()
         bug_tracker = MagicMock(type="jira")
         runtime = MagicMock(debug=False)
+        runtime.get_bug_config.return_value = {}
 
         with self.assertRaises(ValueError, msg="targeted_fixes_only=true but issues.include is empty"):
             await sweep_cli.get_bugs_sweep(runtime, find_bugs_obj, bug_tracker)
@@ -176,6 +184,7 @@ class FindBugsSweepTestCase(unittest.IsolatedAsyncioTestCase):
         find_bugs_obj = sweep_cli.FindBugsSweep()
         bug_tracker = MagicMock(type="jira")
         runtime = MagicMock(debug=False)
+        runtime.get_bug_config.return_value = {}
 
         with self.assertRaises(ValueError, msg="targeted_fixes_only=true but issues.exclude is non-empty"):
             await sweep_cli.get_bugs_sweep(runtime, find_bugs_obj, bug_tracker)
@@ -185,6 +194,7 @@ class FindBugsSweepTestCase(unittest.IsolatedAsyncioTestCase):
     @patch("elliottlib.cli.find_bugs_sweep_cli.get_sweep_cutoff_timestamp", new_callable=AsyncMock, return_value=0)
     async def test_get_bugs_sweep_opt_out_skips_art_managed_filter(self, *_):
         runtime = MagicMock(debug=False)
+        runtime.get_bug_config.return_value = {}
         bug = flexmock(id="OCPBUGS-1")
         find_bugs_obj = sweep_cli.FindBugsSweep(art_managed_trackers_only=False)
         find_bugs_obj.search = Mock(return_value=[bug])
@@ -203,6 +213,7 @@ class FindBugsSweepTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_get_bugs_sweep_filters_shipment_bugs(self, mock_cutoff, mock_bug_ids, mock_shipment_bugs):
         """When filter_attached_bugs=True, bugs in open shipment MRs should be filtered out."""
         runtime = MagicMock(debug=False, group="openshift-4.18", assembly="4.18.40")
+        runtime.get_bug_config.return_value = {}
 
         bug_keep = flexmock(id="OCPBUGS-1")
         bug_filter = flexmock(id="OCPBUGS-2")
@@ -231,6 +242,7 @@ class FindBugsSweepTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_get_bugs_sweep_no_filter_skips_both(self, mock_cutoff, mock_bug_ids, mock_shipment_bugs):
         """When filter_attached_bugs=False, skip both errata and shipment filtering."""
         runtime = MagicMock(debug=False)
+        runtime.get_bug_config.return_value = {}
         bug = flexmock(id="OCPBUGS-1")
 
         find_bugs_obj = sweep_cli.FindBugsSweep(art_managed_trackers_only=False)
@@ -962,6 +974,39 @@ class TestGetBuildsByAdvisoryKind(unittest.TestCase):
         self.assertEqual(result['rpm'], ['rpm-package-1-1.0.0-1.el9'])
         self.assertEqual(result['image'], ['brew-image-container-v1.0.0-1', 'konflux-image-container-v1.0.0-1'])
         self.assertEqual(result['extras'], ['konflux-extras-1.0.0-1.el9'])
+
+
+class TestEvidencePluginLogging(unittest.TestCase):
+    def test_plugin_logging_includes_sanitized_warning_and_decision_details(self):
+        safe_reason = "EVIDENCE_REQUIRES_REVIEW: The evidence could not establish eligibility"
+        safe_warning = "EVIDENCE_LOOKUP_UNAVAILABLE: Unable to retrieve required evidence"
+        plugin_result = PluginResult(
+            plugin_name="test-plugin",
+            decisions=(
+                PluginDecision(
+                    "OCPBUGS-1",
+                    PluginDisposition.REVIEW,
+                    safe_reason,
+                ),
+            ),
+            domain_search_complete=True,
+            warnings=(safe_warning,),
+        )
+        evaluation = PluginEvaluation(
+            claimed_issue_keys=frozenset({"OCPBUGS-1"}),
+            included_issue_keys=frozenset(),
+            results=(plugin_result,),
+        )
+
+        with (
+            patch.object(sweep_cli, "create_plugins", return_value=(Mock(),)),
+            patch.object(sweep_cli, "evaluate_plugins", return_value=evaluation),
+            self.assertLogs(sweep_cli.logger, level="WARNING") as captured_logs,
+        ):
+            sweep_cli._run_evidence_plugins(Mock(), Mock(), ({"name": "test-plugin"},), set())
+
+        self.assertIn(safe_reason, "\n".join(captured_logs.output))
+        self.assertIn(safe_warning, "\n".join(captured_logs.output))
 
 
 if __name__ == '__main__':

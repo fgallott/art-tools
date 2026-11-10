@@ -1,10 +1,11 @@
 import json
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 import click
 from artcommonlib import logutil
 
 from elliottlib import Runtime
+from elliottlib.bug_sweep_plugins.contracts import PluginResult
 from elliottlib.bzutil import Bug
 from elliottlib.cli import common
 from elliottlib.cli.common import click_coroutine
@@ -60,7 +61,7 @@ async def find_bugs_cli(
     cve_only,
     art_managed_trackers_only,
     filter_attached_bugs,
-):
+) -> None:
     """Find OCP bugs for the given group and assembly, eligible for release.
 
     The --group and --assembly sets the criteria for the bugs to be found.
@@ -105,7 +106,7 @@ class FindBugsCli:
         exclude_trackers: bool,
         art_managed_trackers_only: bool,
         filter_attached_bugs: bool = True,
-    ):
+    ) -> None:
         self.runtime = runtime
         self.permissive = permissive
         self.output = output
@@ -114,8 +115,9 @@ class FindBugsCli:
         self.art_managed_trackers_only = art_managed_trackers_only
         self.filter_attached_bugs = filter_attached_bugs
         self.bug_tracker = None
+        self.plugin_results: tuple[PluginResult, ...] = ()
 
-    async def run(self):
+    async def run(self) -> None:
         self.runtime.initialize(mode="both")
         self.bug_tracker = self.runtime.get_bug_tracker('jira')
 
@@ -123,10 +125,37 @@ class FindBugsCli:
         bugs_by_kind_formatted = {kind: sorted([b.id for b in bugs]) for kind, bugs in bugs_by_kind.items()}
 
         if self.output == 'json':
-            click.echo(json.dumps(bugs_by_kind_formatted, indent=4))
+            output: dict[str, Any] = bugs_by_kind_formatted
+            if self.plugin_results:
+                output = {
+                    "bugs_by_kind": bugs_by_kind_formatted,
+                    "evidence_plugins": {
+                        result.plugin_name: self._plugin_decisions_for_json(result) for result in self.plugin_results
+                    },
+                }
+            click.echo(json.dumps(output, indent=4))
         else:
             for kind, bugs in bugs_by_kind_formatted.items():
                 click.echo(f"{kind} bugs: {', '.join(bugs)}")
+
+    @staticmethod
+    def _plugin_decisions_for_json(result: PluginResult) -> list[dict[str, str]]:
+        """
+        Format only INCLUDE and REVIEW decisions from one evidence plugin.
+        """
+        decisions: list[dict[str, str]] = []
+        for decision in result.decisions:
+            disposition = decision.disposition.value
+            if disposition in {"include", "review"}:
+                decisions.append(
+                    {
+                        "issue_key": decision.issue_key,
+                        "disposition": disposition,
+                        "reason": decision.reason,
+                    }
+                )
+
+        return decisions
 
     async def find_bugs(self) -> Dict[str | int, type_bug_set]:
         """Find all eligible bugs for shipping for the current assembly and categorize them by advisory kind.
@@ -134,13 +163,16 @@ class FindBugsCli:
         """
 
         find_bugs_obj = FindBugsSweep(cve_only=self.cve_only, art_managed_trackers_only=self.art_managed_trackers_only)
-        statuses = sorted(find_bugs_obj.status)
-        tr = self.bug_tracker.target_release()
-        LOGGER.info(f"Searching {self.bug_tracker.type} for bugs with status {statuses} and target releases: {tr}\n")
-
+        plugin_results: list[PluginResult] = []
         bugs = await get_bugs_sweep(
-            self.runtime, find_bugs_obj, self.bug_tracker, filter_attached_bugs=self.filter_attached_bugs
+            self.runtime,
+            find_bugs_obj,
+            self.bug_tracker,
+            filter_attached_bugs=self.filter_attached_bugs,
+            log_search=True,
+            plugin_results=plugin_results,
         )
+        self.plugin_results = tuple(plugin_results)
         major_version, minor_version = self.runtime.get_major_minor()
 
         builds_by_advisory_kind = get_builds_by_advisory_kind(self.runtime)
