@@ -1395,11 +1395,14 @@ class RpmLockfilePrototypeGenerator:
             try:
                 pin_result = await self._resolver.resolve(in_yaml, image_pullspec=resolver_pullspec)
             except RuntimeError as e:
+                if not (RpmResolver.parse_missing_packages(str(e)) & set(missing)):
+                    raise
                 self.logger.warning(
-                    f"{distgit_key}: stage {stage_num}: pin pass failed on {arch}, "
-                    f"some Dockerfile packages may be unlocked: {e}"
+                    f"{distgit_key}: stage {stage_num}: reinstall pin failed on {arch}; "
+                    f"resolving Dockerfile packages from repositories without the base image: {e}"
                 )
-                continue
+                bare_config = build_rpms_in_yaml(repo_list, [arch], missing)
+                pin_result = await self._resolver.resolve(bare_config)
 
             if pin_result and any(ae.packages for ae in pin_result.arches):
                 pinned = {pkg.name for ae in pin_result.arches for pkg in ae.packages}

@@ -204,6 +204,58 @@ FAKE_LOCKFILE_DATA = LockfileData(
 )
 
 
+class TestPinMissingDockerfilePackages(unittest.IsolatedAsyncioTestCase):
+    async def test_reinstall_failure_resolves_from_repositories_for_each_arch(self):
+        resolver = MagicMock(spec=RpmResolver)
+        x86 = LockfileData(
+            arches=[
+                ArchResult(
+                    arch="x86_64",
+                    packages=[PackageEntry(name="procps-ng", url="https://example.com/x86.rpm", repoid="baseos")],
+                )
+            ]
+        )
+        arm = LockfileData(
+            arches=[
+                ArchResult(
+                    arch="aarch64",
+                    packages=[PackageEntry(name="procps-ng", url="https://example.com/arm.rpm", repoid="baseos")],
+                )
+            ]
+        )
+        resolver.resolve = AsyncMock(
+            side_effect=[
+                RuntimeError("no package matched: procps-ng"),
+                x86,
+                RuntimeError("no package matched: procps-ng"),
+                arm,
+            ]
+        )
+        with TemporaryDirectory() as tmpdir:
+            generator = RpmLockfilePrototypeGenerator(repos=MagicMock(), working_dir=Path(tmpdir), resolver=resolver)
+            result = await generator._pin_missing_dockerfile_packages(
+                None, ["procps-ng"], [], ["x86_64", "aarch64"], "registry.example/base@sha256:abc", "mta-ui", 1
+            )
+
+        self.assertEqual({entry.arch for entry in result.arches}, {"x86_64", "aarch64"})
+        for index, arch in ((1, "x86_64"), (3, "aarch64")):
+            call = resolver.resolve.await_args_list[index]
+            self.assertEqual(call.args[0].arches, [arch])
+            self.assertEqual(call.args[0].packages, ["procps-ng"])
+            self.assertEqual(call.args[0].reinstallPackages, [])
+            self.assertNotIn("image_pullspec", call.kwargs)
+
+    async def test_unrelated_resolver_failure_is_not_suppressed(self):
+        resolver = MagicMock(spec=RpmResolver)
+        resolver.resolve = AsyncMock(side_effect=RuntimeError("repository unavailable"))
+        with TemporaryDirectory() as tmpdir:
+            generator = RpmLockfilePrototypeGenerator(repos=MagicMock(), working_dir=Path(tmpdir), resolver=resolver)
+            with self.assertRaisesRegex(RuntimeError, "repository unavailable"):
+                await generator._pin_missing_dockerfile_packages(
+                    None, ["procps-ng"], [], ["x86_64"], "registry.example/base@sha256:abc", "mta-ui", 1
+                )
+
+
 class TestRpmLockfilePrototypeGenerator(unittest.TestCase):
     def _make_mock_repo(self, name: str, baseurl: str, content_set_name: str | None = None) -> MagicMock:
         repo = MagicMock()
