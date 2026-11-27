@@ -2072,8 +2072,8 @@ class KonfluxClient:
                         {
                             "name": "rpms-signature-scan",
                             "computeResources": {
-                                "requests": {"memory": "2Gi"},
-                                "limits": {"memory": "2Gi"},
+                                "requests": {"memory": "10Gi", "cpu": "3"},
+                                "limits": {"memory": "10Gi", "cpu": "3"},
                             },
                         }
                     ],

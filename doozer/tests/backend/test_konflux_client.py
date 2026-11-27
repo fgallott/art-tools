@@ -2195,8 +2195,8 @@ class TestEnsureComponent(IsolatedAsyncioTestCase):
         self.assertIs(result, new_resource)
 
 
-class TestRpmsSignatureScanMemoryOverride(IsolatedAsyncioTestCase):
-    """Tests for rpms-signature-scan 2Gi memory override in _new_pipelinerun_for_image_build."""
+class TestRpmsSignatureScanResourcesOverride(IsolatedAsyncioTestCase):
+    """Tests for rpms-signature-scan resource overrides in _new_pipelinerun_for_image_build."""
 
     # Template that includes rpms-signature-scan task (present in real Konflux pipelines)
     _TEMPLATE_WITH_RPM_SCAN = jinja2.Template(
@@ -2251,8 +2251,8 @@ spec:
     )
 
     @patch("doozerlib.backend.konflux_client.KonfluxClient._get_pipelinerun_template")
-    async def test_rpms_signature_scan_gets_2gi_memory(self, mock_get_template):
-        """Test that rpms-signature-scan task gets a 2Gi memory override when present in the pipeline."""
+    async def test_rpms_signature_scan_gets_resource_overrides(self, mock_get_template):
+        """Test that rpms-signature-scan gets memory and CPU overrides when present in the pipeline."""
         mock_get_template.return_value = self._TEMPLATE_WITH_RPM_SCAN
         client = KonfluxClient.__new__(KonfluxClient)
         client._logger = MagicMock()
@@ -2263,8 +2263,8 @@ spec:
         rpm_scan_spec = next(s for s in task_run_specs if s["pipelineTaskName"] == "rpms-signature-scan")
         self.assertIn("stepSpecs", rpm_scan_spec)
         step = next(s for s in rpm_scan_spec["stepSpecs"] if s["name"] == "rpms-signature-scan")
-        self.assertEqual(step["computeResources"]["requests"]["memory"], "2Gi")
-        self.assertEqual(step["computeResources"]["limits"]["memory"], "2Gi")
+        self.assertEqual(step["computeResources"]["requests"], {"memory": "10Gi", "cpu": "3"})
+        self.assertEqual(step["computeResources"]["limits"], {"memory": "10Gi", "cpu": "3"})
 
     @patch("doozerlib.backend.konflux_client.KonfluxClient._get_pipelinerun_template")
     async def test_no_rpms_signature_scan_override_when_task_absent(self, mock_get_template):
